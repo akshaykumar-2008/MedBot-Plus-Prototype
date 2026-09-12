@@ -1,6 +1,7 @@
 #include <ESP8266WiFi.h>
 #include <espnow.h>
 #include "navigation.h"
+#include "rssi_steering.h"
 
 // ==================== CONFIGURATION ====================
 // Checkpoint (Receiver) MAC Address - CHANGE THIS to your checkpoint's MAC
@@ -17,20 +18,33 @@ enum RobotState {
   HOME
 };
 
+// Navigation modes
+enum NavigationMode {
+  SIMPLE_FORWARD,      // Just move forward (basic)
+  RSSI_STEERING        // Compare RSSI from different directions (smart)
+};
+
 // ==================== GLOBAL VARIABLES ====================
 NavigationController navController;
+RSSSteering steering;
 RobotState currentState = INITIALIZATION;
+NavigationMode navMode = RSSI_STEERING; // Set to RSSI_STEERING for smart navigation
 unsigned long lastRSSICheck = 0;
+unsigned long lastSteering = 0;
 int currentRSSI = -100;
 unsigned long pickupWaitStart = 0;
 const unsigned long PICKUP_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
 int reminderCount = 0;
 const int MAX_REMINDERS = 3;
+int steeringCycleCount = 0;
+
+// Steering parameters
+const unsigned long STEERING_INTERVAL = 3000; // Check direction every 3 seconds
+const unsigned long TURN_DURATION = 500; // How long to turn when changing direction
+const unsigned long FORWARD_DURATION = 2500; // How long to move forward between checks
 
 // ==================== ESP-NOW CALLBACK ====================
 void onDataRecv(uint8_t *mac, uint8_t *incomingData, uint8_t len) {
-  // This function is called when data is received from checkpoint
-  // We'll use it to acknowledge receipt but mainly rely on RSSI scanning
   if (len > 0) {
     char message[len + 1];
     memcpy(message, incomingData, len);
@@ -54,6 +68,7 @@ void setup() {
   Serial.println("\n\n");
   Serial.println("=====================================");
   Serial.println("  MedBot+ Controller Started");
+  Serial.println("  Navigation Mode: RSSI Steering");
   Serial.println("=====================================");
   
   // Initialize motors
@@ -110,7 +125,11 @@ void loop() {
       break;
       
     case NAVIGATING:
-      handleNavigating();
+      if (navMode == RSSI_STEERING) {
+        handleNavigatingWithSteering(currentTime);
+      } else {
+        handleNavigating(currentTime);
+      }
       break;
       
     case ARRIVED:
@@ -167,7 +186,10 @@ void handleSearching(unsigned long currentTime) {
         // Check if we should transition to NAVIGATING
         if (currentRSSI > -85) { // Checkpoint detected
           Serial.println("[SEARCH->NAVIGATING] Checkpoint signal detected!");
+          Serial.println("[NAVIGATE] Starting directional RSSI steering...");
           currentState = NAVIGATING;
+          steeringCycleCount = 0;
+          lastSteering = currentTime;
           navController.moveForward();
           return;
         }
@@ -176,12 +198,107 @@ void handleSearching(unsigned long currentTime) {
     
     WiFi.scanDelete();
   }
-  
-  // Keep searching (robot can move slowly in search pattern if desired)
-  // For now, just wait and scan periodically
 }
 
-void handleNavigating() {
+// ==================== SMART NAVIGATION WITH STEERING ====================
+
+void handleNavigatingWithSteering(unsigned long currentTime) {
+  // Every STEERING_INTERVAL, check which direction has strongest RSSI
+  if (currentTime - lastSteering > STEERING_INTERVAL) {
+    lastSteering = currentTime;
+    
+    Serial.print("\n[STEERING CYCLE #");
+    Serial.print(steeringCycleCount++);
+    Serial.println("]");
+    
+    navController.stop();
+    delay(200);
+    
+    // Step 1: Scan forward (straight)
+    Serial.println("  1. Measuring FORWARD direction...");
+    int forwardRSSI = scanRSSI();
+    steering.recordForwardRSSI(forwardRSSI);
+    navController.stop();
+    delay(200);
+    
+    // Step 2: Scan left
+    Serial.println("  2. Measuring LEFT direction (turning 45°)...");
+    navController.turnLeft(150);
+    delay(500);
+    int leftRSSI = scanRSSI();
+    steering.recordLeftRSSI(leftRSSI);
+    navController.stop();
+    delay(200);
+    
+    // Step 3: Scan right
+    Serial.println("  3. Measuring RIGHT direction (turning 90° from original)...");
+    navController.turnRight(150);
+    delay(1000);
+    int rightRSSI = scanRSSI();
+    steering.recordRightRSSI(rightRSSI);
+    navController.stop();
+    delay(200);
+    
+    // Step 4: Determine best direction
+    int bestDirection = steering.getBestDirection();
+    
+    Serial.print("[DECISION] Best direction: ");
+    if (bestDirection == 0) {
+      Serial.println("FORWARD");
+      navController.moveForward();
+    } else if (bestDirection == 1) {
+      Serial.println("LEFT");
+      navController.turnLeft(150);
+      delay(TURN_DURATION);
+      navController.moveForward();
+    } else if (bestDirection == 2) {
+      Serial.println("RIGHT");
+      navController.turnRight(150);
+      delay(TURN_DURATION);
+      navController.moveForward();
+    }
+    
+    // Check if we've arrived
+    int avgRSSI = navController.getAverageRSSI();
+    Serial.print("[PROGRESS] Average RSSI: ");
+    Serial.print(avgRSSI);
+    Serial.print(" dBm | Threshold: ");
+    Serial.println(RSSI_PROXIMITY_THRESHOLD);
+    
+    if (avgRSSI > RSSI_PROXIMITY_THRESHOLD) {
+      Serial.println("[NAVIGATE->ARRIVED] Proximity threshold reached!");
+      navController.stop();
+      currentState = ARRIVED;
+      return;
+    }
+  }
+}
+
+// Simple RSSI scan function
+int scanRSSI() {
+  int numNetworks = WiFi.scanNetworks(false, true);
+  int rssi = -100;
+  
+  for (int i = 0; i < numNetworks; i++) {
+    uint8_t *scannedMAC = WiFi.BSSID(i);
+    if (isSameMac(scannedMAC, checkpointMAC)) {
+      rssi = WiFi.RSSI(i);
+      navController.addRSSIReading(rssi);
+      break;
+    }
+  }
+  
+  WiFi.scanDelete();
+  Serial.print("     RSSI: ");
+  Serial.print(rssi);
+  Serial.println(" dBm");
+  
+  return rssi;
+}
+
+// ==================== BASIC NAVIGATION (Fallback) ====================
+
+void handleNavigating(unsigned long currentTime) {
   // Continuously scan for RSSI and navigate towards it
   if (millis() - lastRSSICheck > RSSI_CHECK_INTERVAL) {
     lastRSSICheck = millis();
@@ -220,6 +337,8 @@ void handleNavigating() {
     WiFi.scanDelete();
   }
 }
+
+// ==================== ARRIVAL & PICKUP ====================
 
 void handleArrived() {
   Serial.println("\n[STATE] ARRIVED at checkpoint!");
